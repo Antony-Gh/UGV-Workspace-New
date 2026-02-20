@@ -1,69 +1,67 @@
 /**
  * @file    main.c
- * @brief   UGV firmware entry point — STM32H743ZI bare-metal.
+ * @brief   UGV Motor Controller — Application entry point.
  *
- * Initialisation sequence:
- *   1. HAL_Init()
- *   2. SystemClock_Config()  — 480 MHz via PLL1
- *   3. GPIO init             — E-STOP, contactor, direction, enable, debug
- *   4. Timer init            — PWM (TIM1/TIM8), encoders (TIM2-5), loop (TIM6)
- *   5. FDCAN init            — FDCAN1 at 1/5 Mbps
- *   6. Module init           — Safety, Motors, Fault, CAN, Telemetry, Control
- * Loop
- *   7. Safety_SetReady()
+ * Initialises all peripherals (clocks, GPIO, timers, FDCAN, ADC),
+ * then starts the module layer (Safety, Fault, Motors, CAN, Config,
+ * Lights, Telemetry, Control Loop).
  *
- * Main loop:
- *   - Telemetry_Update()    — 50 ms CAN TX
- *   - Optional UART debug   — compile with -DDEBUG=1
- *   - __WFI()               — idle until next interrupt
+ * Super-loop handles non-time-critical tasks:
+ *   - Telemetry transmission (50/100/200 ms staggered)
+ *   - LED pattern updates (~20 Hz)
+ *   - Future: CAN diagnostics, watchdog refresh
  *
- * All time-critical work runs in the TIM6 1 kHz ISR.
+ * Time-critical work (1 kHz) is inside the TIM6 ISR:
+ *   - Encoder reading
+ *   - Velocity command latch (speed-clamped)
+ *   - Odometry accumulation
+ *   - PID control
+ *   - PWM output
+ *   - Fault detection
+ *   - Safety FSM
+ *
+ * MCU: STM32H743ZI (480 MHz, Cortex-M7)
  *
  * @author  UGV Firmware Team
  */
 
-/* ──────────────────── Includes ────────────────────────────────── */
+#include "stm32h7xx_hal.h"
 
+/* ── Module headers ─── */
 #include "can_comm.h"
+#include "config.h"
 #include "control_loop.h"
 #include "fault.h"
+#include "lights.h"
 #include "motor.h"
 #include "pid.h"
 #include "safety.h"
-#include "stm32h7xx_hal.h"
 #include "telemetry.h"
-#include <string.h>
 
+/* ──────────────────── HAL Peripheral Handles ──────────────────── */
 
-/* ──────────────────── HAL Handles ─────────────────────────────── */
+/* PWM timers (20 kHz, 4 channels total) */
+TIM_HandleTypeDef htim1; /* FL + FR PWM         */
+TIM_HandleTypeDef htim8; /* RL + RR PWM         */
 
-/* PWM timers (4 channels total across 2 timers) */
-TIM_HandleTypeDef htim1; /* PWM: FL (CH1), FR (CH2) */
-TIM_HandleTypeDef htim8; /* PWM: RL (CH1), RR (CH2) */
+/* Encoder timers (quadrature mode) */
+TIM_HandleTypeDef htim2; /* FL encoder           */
+TIM_HandleTypeDef htim3; /* FR encoder           */
+TIM_HandleTypeDef htim4; /* RL encoder           */
+TIM_HandleTypeDef htim5; /* RR encoder           */
 
-/* Encoder timers (one per motor) */
-TIM_HandleTypeDef htim2; /* Encoder: FL */
-TIM_HandleTypeDef htim3; /* Encoder: FR */
-TIM_HandleTypeDef htim4; /* Encoder: RL */
-TIM_HandleTypeDef htim5; /* Encoder: RR */
-
-/* Control loop timer */
-TIM_HandleTypeDef htim6; /* 1 kHz update interrupt */
+/* Control loop timer (1 kHz ISR) */
+TIM_HandleTypeDef htim6;
 
 /* CAN-FD */
 FDCAN_HandleTypeDef hfdcan1;
 
-/* UART for debug (optional) */
-#ifdef DEBUG
-UART_HandleTypeDef huart3;
-#endif
+/* ADC for battery monitoring */
+ADC_HandleTypeDef hadc1;
 
-/* ──────────────────── Global State ────────────────────────────── */
+/* ──────────────────── Global Module State ─────────────────────── */
 
-/** 4-wheel motor array — hardware config + runtime state. */
 Motor_t g_motors[MOTOR_COUNT];
-
-/** Global fault state — shared between control loop & main. */
 Fault_State_t g_fault_state;
 
 /* ──────────────────── Forward Declarations ────────────────────── */
@@ -78,21 +76,19 @@ static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_FDCAN1_Init(void);
+static void MX_ADC1_Init(void);
 static void Motor_HW_Config(void);
-#ifdef DEBUG
-static void MX_USART3_UART_Init(void);
-#endif
 
-/* ═══════════════════════════════════════════════════════════════════
- *  MAIN
- * ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================== */
+/*                          main()                                 */
+/* ============================================================== */
 
 int main(void) {
-  /* ── 1. HAL & System Clock ───────────────────────────────── */
+  /* ── HAL & system init ─────────────────────────────────────── */
   HAL_Init();
   SystemClock_Config();
 
-  /* ── 2. Peripheral Init ──────────────────────────────────── */
+  /* ── Peripheral init ───────────────────────────────────────── */
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_TIM8_Init();
@@ -102,58 +98,54 @@ int main(void) {
   MX_TIM5_Init();
   MX_TIM6_Init();
   MX_FDCAN1_Init();
-#ifdef DEBUG
-  MX_USART3_UART_Init();
-#endif
+  MX_ADC1_Init();
 
-  /* ── 3. Module Init ──────────────────────────────────────── */
+  /* ── Motor hardware descriptor setup ───────────────────────── */
+  Motor_HW_Config();
+
+  /* ── Module initialisation (order matters) ─────────────────── */
   Safety_Init();
   Fault_Init(&g_fault_state);
-
-  /* Assign hardware descriptors to motor array */
-  Motor_HW_Config();
+  Config_Init(); /* Sets default profile (IGVC) + fault timeout    */
   Motor_Init(g_motors);
-
   CAN_Comm_Init(&hfdcan1);
-  Telemetry_Init();
+  Lights_Init();
+  Telemetry_Init(&hadc1);
 
-  /* Start 1 kHz control loop (must be last — begins ISR firing) */
-  ControlLoop_Init(&htim6, g_motors, &g_fault_state);
-
-  /* ── 4. Enter READY state ────────────────────────────────── */
+  /* ── Signal that all init is complete ──────────────────────── */
   Safety_SetReady();
 
-  /* ═════════════════════════════════════════════════════════════
-   *  SUPER-LOOP
-   *  Only non-time-critical work runs here.
-   * ═════════════════════════════════════════════════════════════ */
+  /* ── Start control loop (TIM6 interrupt — must be last) ──── */
+  ControlLoop_Init(&htim6, g_motors, &g_fault_state);
+
+  /* ============================================================ */
+  /*                    Main Super-loop                            */
+  /* ============================================================ */
+
   while (1) {
-    /* 50 ms periodic telemetry over CAN */
+    /* Telemetry: motor (50 ms), odometry (100 ms), battery (200 ms) */
     Telemetry_Update(g_motors, &g_fault_state);
 
-#ifdef DEBUG
-    /* Optional: send debug info over UART (non-blocking) */
-    /* Disabled in release to avoid timing interference.   */
-#endif
+    /* LED pattern update (~20 Hz effective with main loop speed) */
+    Lights_Update();
 
-    /* Idle until next interrupt — saves power */
-    __WFI();
+    /* Future: IWDG refresh, CAN diagnostics, etc. */
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  HAL CALLBACKS
- * ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================== */
+/*                   HAL Callback Routing                          */
+/* ============================================================== */
 
 /**
- * @brief  TIM period-elapsed callback — routes TIM6 to control loop.
+ * @brief  Timer period-elapsed callback — routes TIM6 to control loop.
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   ControlLoop_TimerCallback(htim);
 }
 
 /**
- * @brief  FDCAN RX FIFO0 callback — routes to CAN comm module.
+ * @brief  FDCAN RX FIFO 0 callback — routes to CAN comm.
  */
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
                                uint32_t RxFifo0ITs) {
@@ -161,89 +153,81 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
 }
 
 /**
- * @brief  EXTI callback — routes E-STOP pin to safety module.
+ * @brief  GPIO EXTI callback — handles both E-STOP inputs.
+ * @param  GPIO_Pin  Pin that triggered the interrupt.
+ *
+ * Mechanical E-STOP : PC13 (GPIO_PIN_13, EXTI15_10_IRQn, priority 0,0)
+ * Wireless E-STOP   : PG0  (GPIO_PIN_0,  EXTI0_IRQn,     priority 0,1)
  */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-  if (GPIO_Pin == ESTOP_GPIO_PIN) {
+  if (GPIO_Pin == ESTOP_GPIO_PIN || GPIO_Pin == ESTOP_WIRELESS_GPIO_PIN) {
     Safety_ESTOP_IRQ(g_motors);
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  PERIPHERAL CONFIGURATION
- *  (In a CubeMX project, these are auto-generated.
- *   Provided here as reference implementations.)
- * ═══════════════════════════════════════════════════════════════════ */
+/* ============================================================== */
+/*                  Peripheral Configuration                       */
+/* ============================================================== */
 
 /**
- * @brief  System Clock Configuration — 480 MHz via PLL1.
- *
- * HSE → PLL1 → SYSCLK = 480 MHz
- * AHB  = 240 MHz
- * APB1 = 120 MHz (timer clock = 240 MHz)
- * APB2 = 120 MHz (timer clock = 240 MHz)
+ * @brief  System clock configuration for STM32H743ZI.
+ *         480 MHz SYSCLK, 240 MHz AHB, 120 MHz APB1/APB2.
  */
 static void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /* Supply configuration — LDO */
-  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
-
-  /* Voltage scaling for 480 MHz operation */
+  /* Supply configuration — direct SMPS (Nucleo-144 default) */
+  HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY);
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
   while (!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {
   }
 
-  /* HSE Oscillator — 25 MHz crystal on Nucleo-144 */
+  /* HSE oscillator → PLL1 → 480 MHz */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS; /* ST-Link MCO */
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS; /* Nucleo ST-Link 8 MHz */
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 5;   /* 25 MHz / 5   = 5 MHz  */
-  RCC_OscInitStruct.PLL.PLLN = 192; /* 5 MHz × 192  = 960 MHz */
-  RCC_OscInitStruct.PLL.PLLP = 2;   /* 960 / 2      = 480 MHz */
-  RCC_OscInitStruct.PLL.PLLQ = 4;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
+  RCC_OscInitStruct.PLL.PLLM = 1U;
+  RCC_OscInitStruct.PLL.PLLN = 120U;
+  RCC_OscInitStruct.PLL.PLLP = 2U;
+  RCC_OscInitStruct.PLL.PLLQ = 20U; /* FDCAN kernel clock = 48 MHz */
+  RCC_OscInitStruct.PLL.PLLR = 2U;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
-  RCC_OscInitStruct.PLL.PLLFRACN = 0;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
-    Error_Handler();
-  }
+  RCC_OscInitStruct.PLL.PLLFRACN = 0U;
+  HAL_RCC_OscConfig(&RCC_OscInitStruct);
 
-  /* Clock tree */
+  /* Bus clocks */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
                                 RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2 |
-                                RCC_CLOCKTYPE_D3PCLK1 | RCC_CLOCKTYPE_D1PCLK1;
+                                RCC_CLOCKTYPE_D1PCLK1 | RCC_CLOCKTYPE_D3PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2; /* 240 MHz */
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;  /* 240 MHz */
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2; /* 120 MHz */
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2; /* 120 MHz */
   RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider =
-      RCC_APB1_DIV2; /* 120 MHz, TIM clk 240 MHz */
-  RCC_ClkInitStruct.APB2CLKDivider =
-      RCC_APB2_DIV2; /* 120 MHz, TIM clk 240 MHz */
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
-    Error_Handler();
-  }
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4);
 }
 
-/* ─────────────────── GPIO Init ────────────────────────────────── */
-
 /**
- * @brief  Configure GPIOs: motor direction, enable, overcurrent,
- *         E-STOP (EXTI), contactor, debug output.
+ * @brief  GPIO initialisation.
  *
- * Pin assignments (example — adjust to your PCB schematic):
- *
- *   Motor Direction:  PA0 (FL), PA1 (FR), PA2 (RL), PA3 (RR)
- *   Motor Enable:     PD0 (FL), PD1 (FR), PD2 (RL), PD3 (RR)
- *   Overcurrent In:   PE0 (FL), PE1 (FR), PE2 (RL), PE3 (RR) — active-low
- *   E-STOP:           PC13 — EXTI falling edge
- *   Contactor:        PD4 — push-pull output
- *   Debug:            PB0 — push-pull output
+ *  Configured pins:
+ *    Motor direction   : PA0–PA3  (push-pull output)
+ *    Motor enable      : PA8–PA11 (push-pull output)
+ *    Overcurrent input : PB4–PB7  (input, pull-up)
+ *    Mechanical E-STOP : PC13     (EXTI falling-edge, pull-up, priority 0,0)
+ *    Wireless E-STOP   : PG0      (EXTI falling-edge, pull-up, priority 0,1)
+ *    Contactor relay   : PD4      (push-pull output)
+ *    Isolation relay   : PD5      (push-pull output)
+ *    Debug toggle      : PB0      (push-pull output)
+ *    LED Red           : PF0      (push-pull output)
+ *    LED Green         : PF1      (push-pull output)
+ *    LED Blue          : PF2      (push-pull output)
+ *    Laser pointer     : PF3      (push-pull output)
  */
 static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -253,84 +237,102 @@ static void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
 
-  /* Motor direction: PA0–PA3, push-pull output */
+  /* ── Motor direction: PA0–PA3 (push-pull output) ─────────── */
   GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Motor enable: PD0–PD3, push-pull output */
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  /* ── Motor enable: PA8–PA11 (push-pull output) ──────────── */
+  GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Contactor relay: PD4, push-pull output */
-  GPIO_InitStruct.Pin = GPIO_PIN_4;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_RESET); /* OFF by default */
-
-  /* Debug GPIO: PB0 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* Overcurrent inputs: PE0–PE3, pull-up (active-low fault) */
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
+  /* ── Overcurrent inputs: PB4–PB7 (input, pull-up) ──────── */
+  GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* E-STOP: PC13, EXTI falling-edge interrupt */
+  /* ── Debug toggle: PB0 (push-pull output) ────────────────── */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* ── Mechanical E-STOP: PC13, EXTI falling-edge ──────────── */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /* Enable EXTI interrupt for E-STOP (highest priority) */
+  /* EXTI15_10 — highest priority for mechanical E-STOP */
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* ── Wireless E-STOP: PG0, EXTI falling-edge ────────────── */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  /* EXTI0 — slightly lower sub-priority than mechanical */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 1);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  /* ── Contactor relay: PD4 (push-pull output, initial LOW) ── */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /* ── Isolation relay: PD5 (push-pull output, initial LOW) ── */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /* ── LED outputs: PF0–PF3 (push-pull output, initial LOW) ── */
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3,
+                    GPIO_PIN_RESET);
 }
 
-/* ─────────────────── PWM Timer Init ───────────────────────────── */
-
 /**
- * @brief  TIM1 — PWM channels 1 & 2 for front-left / front-right motors.
- *
- * Timer clock = 240 MHz (APB2 timer).
- * Prescaler = 0 → counter clock = 240 MHz.
- * ARR = 11999 → PWM freq = 240 MHz / (11999+1) = 20 kHz.
+ * @brief  TIM1 initialisation — PWM for FL + FR motors (20 kHz).
  */
 static void MX_TIM1_Init(void) {
   __HAL_RCC_TIM1_CLK_ENABLE();
 
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0U;
+  htim1.Init.Prescaler = 0U; /* 240 MHz timer clock (APB2 × 2) */
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = MOTOR_PWM_ARR;
+  htim1.Init.Period = MOTOR_PWM_ARR; /* 11999 → 20 kHz */
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0U;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   HAL_TIM_PWM_Init(&htim1);
 
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0U;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1);
-  HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2);
+  TIM_OC_InitTypeDef oc = {0};
+  oc.OCMode = TIM_OCMODE_PWM1;
+  oc.Pulse = 0U;
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
 
-  /* Enable TIM1 main output (required for advanced timers) */
-  __HAL_TIM_MOE_ENABLE(&htim1);
+  HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_1); /* FL */
+  HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_2); /* FR */
 }
 
 /**
- * @brief  TIM8 — PWM channels 1 & 2 for rear-left / rear-right motors.
- *         Same config as TIM1.
+ * @brief  TIM8 initialisation — PWM for RL + RR motors (20 kHz).
  */
 static void MX_TIM8_Init(void) {
   __HAL_RCC_TIM8_CLK_ENABLE();
@@ -344,108 +346,161 @@ static void MX_TIM8_Init(void) {
   htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   HAL_TIM_PWM_Init(&htim8);
 
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0U;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  HAL_TIM_PWM_ConfigChannel(&htim8, &sConfigOC, TIM_CHANNEL_1);
-  HAL_TIM_PWM_ConfigChannel(&htim8, &sConfigOC, TIM_CHANNEL_2);
+  TIM_OC_InitTypeDef oc = {0};
+  oc.OCMode = TIM_OCMODE_PWM1;
+  oc.Pulse = 0U;
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
 
-  __HAL_TIM_MOE_ENABLE(&htim8);
+  HAL_TIM_PWM_ConfigChannel(&htim8, &oc, TIM_CHANNEL_1); /* RL */
+  HAL_TIM_PWM_ConfigChannel(&htim8, &oc, TIM_CHANNEL_2); /* RR */
 }
-
-/* ─────────────────── Encoder Timer Init ───────────────────────── */
 
 /**
- * @brief Initialise a timer in encoder mode (quadrature, both edges).
+ * @brief  TIM2 encoder mode — Front-Left motor (32-bit).
  */
-static void Encoder_Timer_Init(TIM_HandleTypeDef *htim, TIM_TypeDef *instance) {
-  htim->Instance = instance;
-  htim->Init.Prescaler = 0U;
-  htim->Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim->Init.Period = 0xFFFFFFFF; /* 32-bit for TIM2/5, 0xFFFF for TIM3/4 */
-  htim->Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0x0F; /* Digital filter to reject noise */
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0x0F;
-
-  HAL_TIM_Encoder_Init(htim, &sConfig);
-}
-
 static void MX_TIM2_Init(void) {
   __HAL_RCC_TIM2_CLK_ENABLE();
-  Encoder_Timer_Init(&htim2, TIM2);
-}
 
-static void MX_TIM3_Init(void) {
-  __HAL_RCC_TIM3_CLK_ENABLE();
-  htim3.Instance = TIM3;
-  /* TIM3 is 16-bit — set period accordingly */
-  htim3.Init.Period = 0xFFFF;
-  Encoder_Timer_Init(&htim3, TIM3);
-}
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0U;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 0xFFFFFFFFU; /* 32-bit */
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
-static void MX_TIM4_Init(void) {
-  __HAL_RCC_TIM4_CLK_ENABLE();
-  htim4.Instance = TIM4;
-  htim4.Init.Period = 0xFFFF;
-  Encoder_Timer_Init(&htim4, TIM4);
-}
+  TIM_Encoder_InitTypeDef enc = {0};
+  enc.EncoderMode = TIM_ENCODERMODE_TI12;
+  enc.IC1Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC1Prescaler = TIM_ICPSC_DIV1;
+  enc.IC1Filter = 0x0FU;
+  enc.IC2Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC2Prescaler = TIM_ICPSC_DIV1;
+  enc.IC2Filter = 0x0FU;
 
-static void MX_TIM5_Init(void) {
-  __HAL_RCC_TIM5_CLK_ENABLE();
-  Encoder_Timer_Init(&htim5, TIM5);
+  HAL_TIM_Encoder_Init(&htim2, &enc);
 }
-
-/* ─────────────────── TIM6 (Control Loop Timer) ────────────────── */
 
 /**
- * @brief  TIM6 — 1 kHz update interrupt for control loop.
- *
- * Timer clock = 240 MHz (APB1 timer).
- * Prescaler = 239 → counter clock = 1 MHz.
- * ARR = 999 → update rate = 1 MHz / 1000 = 1 kHz.
+ * @brief  TIM3 encoder mode — Front-Right motor (16-bit).
+ */
+static void MX_TIM3_Init(void) {
+  __HAL_RCC_TIM3_CLK_ENABLE();
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0U;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 0xFFFFU; /* 16-bit */
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  TIM_Encoder_InitTypeDef enc = {0};
+  enc.EncoderMode = TIM_ENCODERMODE_TI12;
+  enc.IC1Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC1Prescaler = TIM_ICPSC_DIV1;
+  enc.IC1Filter = 0x0FU;
+  enc.IC2Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC2Prescaler = TIM_ICPSC_DIV1;
+  enc.IC2Filter = 0x0FU;
+
+  HAL_TIM_Encoder_Init(&htim3, &enc);
+}
+
+/**
+ * @brief  TIM4 encoder mode — Rear-Left motor (16-bit).
+ */
+static void MX_TIM4_Init(void) {
+  __HAL_RCC_TIM4_CLK_ENABLE();
+
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0U;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 0xFFFFU;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  TIM_Encoder_InitTypeDef enc = {0};
+  enc.EncoderMode = TIM_ENCODERMODE_TI12;
+  enc.IC1Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC1Prescaler = TIM_ICPSC_DIV1;
+  enc.IC1Filter = 0x0FU;
+  enc.IC2Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC2Prescaler = TIM_ICPSC_DIV1;
+  enc.IC2Filter = 0x0FU;
+
+  HAL_TIM_Encoder_Init(&htim4, &enc);
+}
+
+/**
+ * @brief  TIM5 encoder mode — Rear-Right motor (32-bit).
+ */
+static void MX_TIM5_Init(void) {
+  __HAL_RCC_TIM5_CLK_ENABLE();
+
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 0U;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 0xFFFFFFFFU; /* 32-bit */
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  TIM_Encoder_InitTypeDef enc = {0};
+  enc.EncoderMode = TIM_ENCODERMODE_TI12;
+  enc.IC1Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC1Prescaler = TIM_ICPSC_DIV1;
+  enc.IC1Filter = 0x0FU;
+  enc.IC2Polarity = TIM_ICPOLARITY_RISING;
+  enc.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  enc.IC2Prescaler = TIM_ICPSC_DIV1;
+  enc.IC2Filter = 0x0FU;
+
+  HAL_TIM_Encoder_Init(&htim5, &enc);
+}
+
+/**
+ * @brief  TIM6 initialisation — 1 kHz control loop interrupt.
+ *         APB1 timer clock = 240 MHz.
+ *         PSC = 23, ARR = 9999 → 240 000 000 / (24 × 10000) = 1000 Hz.
  */
 static void MX_TIM6_Init(void) {
   __HAL_RCC_TIM6_CLK_ENABLE();
 
   htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 239U;
+  htim6.Init.Prescaler = 23U;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 999U;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  htim6.Init.Period = 9999U;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   HAL_TIM_Base_Init(&htim6);
 
-  /* TIM6 interrupt — priority just below E-STOP */
+  /* TIM6 interrupt — higher priority than CAN, lower than E-STOP */
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
 }
 
-/* ─────────────────── FDCAN1 Init ──────────────────────────────── */
-
 /**
- * @brief  FDCAN1 — 1 Mbps nominal / 5 Mbps data phase.
+ * @brief  FDCAN1 initialisation — 1 Mbps nominal / 5 Mbps data.
  *
- * FDCAN kernel clock sourced from PLL1Q (= 240 MHz).
+ *  FDCAN kernel clock: PLL1Q = 48 MHz.
  *
- * Nominal: 240 MHz / ((NomPresc) × (1 + NomSeg1 + NomSeg2))
- *   = 240 / (3 × (1 + 63 + 16)) = 240 / (3 × 80) = 1 Mbps
+ *  Nominal:  48 MHz / 3 = 16 tq → 1 Mbps
+ *    Seg1 = 13, Seg2 = 2, SJW = 2   (SP = 87.5%)
  *
- * Data: 240 MHz / ((DataPresc) × (1 + DataSeg1 + DataSeg2))
- *   = 240 / (1 × (1 + 38 + 9)) = 240 / 48 = 5 Mbps
+ *  Data:     48 MHz / 1 = 48 tq → 5 Mbps? No—
+ *    Actually  48 / 1 / (7+2) = 5.33 Mbps — adjusted:
+ *    PSC=1, Seg1=7, Seg2=2, 48/1/(1+7+2) = 4.8 Mbps
+ *    For exact 5 Mbps, use PLL1Q = 40 MHz or adjust.
+ *    Using closest achievable with 48 MHz kernel clock:
+ *    PSC=1, Seg1=6, Seg2=1, SJW=1 → 48/1/(1+6+1) = 6 Mbps — too fast.
+ *    PSC=1, Seg1=7, Seg2=2, SJW=2 → 48/1/(1+7+2) = 4.8 Mbps — close enough.
+ *
+ *  Note: Adjust PLL1Q for exact 5 Mbps if required.
  */
 static void MX_FDCAN1_Init(void) {
   __HAL_RCC_FDCAN_CLK_ENABLE();
@@ -454,137 +509,143 @@ static void MX_FDCAN1_Init(void) {
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_BRS;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
   hfdcan1.Init.AutoRetransmission = ENABLE;
-  hfdcan1.Init.TransmitPause = DISABLE;
-  hfdcan1.Init.ProtocolException = ENABLE;
+  hfdcan1.Init.TransmitPause = ENABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
 
   /* Nominal bit timing: 1 Mbps */
   hfdcan1.Init.NominalPrescaler = 3U;
-  hfdcan1.Init.NominalSyncJumpWidth = 16U;
-  hfdcan1.Init.NominalTimeSeg1 = 63U;
-  hfdcan1.Init.NominalTimeSeg2 = 16U;
+  hfdcan1.Init.NominalSyncJumpWidth = 2U;
+  hfdcan1.Init.NominalTimeSeg1 = 13U;
+  hfdcan1.Init.NominalTimeSeg2 = 2U;
 
-  /* Data bit timing: 5 Mbps */
+  /* Data bit timing: ~4.8 Mbps (closest to 5 Mbps with 48 MHz kernel) */
   hfdcan1.Init.DataPrescaler = 1U;
-  hfdcan1.Init.DataSyncJumpWidth = 4U;
-  hfdcan1.Init.DataTimeSeg1 = 38U;
-  hfdcan1.Init.DataTimeSeg2 = 9U;
+  hfdcan1.Init.DataSyncJumpWidth = 2U;
+  hfdcan1.Init.DataTimeSeg1 = 7U;
+  hfdcan1.Init.DataTimeSeg2 = 2U;
 
-  hfdcan1.Init.MessageRAMOffset = 0U;
-  hfdcan1.Init.StdFiltersNbr = 2U;
+  /* Message RAM configuration */
+  hfdcan1.Init.StdFiltersNbr = 4U; /* Filters 0–3 */
   hfdcan1.Init.ExtFiltersNbr = 0U;
   hfdcan1.Init.RxFifo0ElmtsNbr = 8U;
   hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_64;
+  hfdcan1.Init.RxFifo1ElmtsNbr = 0U;
+  hfdcan1.Init.RxBuffersNbr = 0U;
+  hfdcan1.Init.TxEventsNbr = 0U;
+  hfdcan1.Init.TxBuffersNbr = 0U;
   hfdcan1.Init.TxFifoQueueElmtsNbr = 4U;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_64;
 
-  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
-    Error_Handler();
-  }
+  HAL_FDCAN_Init(&hfdcan1);
 
-  /* FDCAN interrupt */
+  /* FDCAN1 interrupt — lower priority than TIM6 */
   HAL_NVIC_SetPriority(FDCAN1_IT0_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(FDCAN1_IT0_IRQn);
 }
 
-/* ─────────────────── Motor Hardware Config ────────────────────── */
+/**
+ * @brief  ADC1 initialisation for battery monitoring.
+ *
+ *  Channels:
+ *    ADC_CHANNEL_4  (PA4) — Battery voltage (via voltage divider)
+ *    ADC_CHANNEL_5  (PA5) — Battery current (ACS712 sensor)
+ *    ADC_CHANNEL_6  (PA6) — Motor/MCU temperature (LM35 or similar)
+ *
+ *  Single conversion mode — channels are selected at read time.
+ */
+static void MX_ADC1_Init(void) {
+  __HAL_RCC_ADC12_CLK_ENABLE();
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV4; /* ~60 MHz / 4 = 15 MHz */
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE; /* Single channel at a time */
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1U;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DR;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+
+  HAL_ADC_Init(&hadc1);
+
+  /* Run calibration */
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+}
 
 /**
- * @brief  Assign HAL handles & GPIO pins to the motor array.
- *         Adjust pin assignments to match your PCB schematic.
+ * @brief  Populate motor hardware descriptors.
+ *
+ *  Motor mapping:
+ *    [0] FL — TIM1_CH1 PWM, TIM2 encoder, PA0 dir, PA8  en, PB4 OC
+ *    [1] FR — TIM1_CH2 PWM, TIM3 encoder, PA1 dir, PA9  en, PB5 OC
+ *    [2] RL — TIM8_CH1 PWM, TIM4 encoder, PA2 dir, PA10 en, PB6 OC
+ *    [3] RR — TIM8_CH2 PWM, TIM5 encoder, PA3 dir, PA11 en, PB7 OC
  */
 static void Motor_HW_Config(void) {
-  /* Front-Left (index 0) */
+  /* ── FL ────────────────────────────────────────────────────── */
   g_motors[0].hw.pwm_timer = &htim1;
   g_motors[0].hw.pwm_channel = TIM_CHANNEL_1;
   g_motors[0].hw.enc_timer = &htim2;
   g_motors[0].hw.dir_port = GPIOA;
   g_motors[0].hw.dir_pin = GPIO_PIN_0;
-  g_motors[0].hw.en_port = GPIOD;
-  g_motors[0].hw.en_pin = GPIO_PIN_0;
-  g_motors[0].hw.oc_port = GPIOE;
-  g_motors[0].hw.oc_pin = GPIO_PIN_0;
+  g_motors[0].hw.en_port = GPIOA;
+  g_motors[0].hw.en_pin = GPIO_PIN_8;
+  g_motors[0].hw.oc_port = GPIOB;
+  g_motors[0].hw.oc_pin = GPIO_PIN_4;
 
-  /* Front-Right (index 1) */
+  /* ── FR ────────────────────────────────────────────────────── */
   g_motors[1].hw.pwm_timer = &htim1;
   g_motors[1].hw.pwm_channel = TIM_CHANNEL_2;
   g_motors[1].hw.enc_timer = &htim3;
   g_motors[1].hw.dir_port = GPIOA;
   g_motors[1].hw.dir_pin = GPIO_PIN_1;
-  g_motors[1].hw.en_port = GPIOD;
-  g_motors[1].hw.en_pin = GPIO_PIN_1;
-  g_motors[1].hw.oc_port = GPIOE;
-  g_motors[1].hw.oc_pin = GPIO_PIN_1;
+  g_motors[1].hw.en_port = GPIOA;
+  g_motors[1].hw.en_pin = GPIO_PIN_9;
+  g_motors[1].hw.oc_port = GPIOB;
+  g_motors[1].hw.oc_pin = GPIO_PIN_5;
 
-  /* Rear-Left (index 2) */
+  /* ── RL ────────────────────────────────────────────────────── */
   g_motors[2].hw.pwm_timer = &htim8;
   g_motors[2].hw.pwm_channel = TIM_CHANNEL_1;
   g_motors[2].hw.enc_timer = &htim4;
   g_motors[2].hw.dir_port = GPIOA;
   g_motors[2].hw.dir_pin = GPIO_PIN_2;
-  g_motors[2].hw.en_port = GPIOD;
-  g_motors[2].hw.en_pin = GPIO_PIN_2;
-  g_motors[2].hw.oc_port = GPIOE;
-  g_motors[2].hw.oc_pin = GPIO_PIN_2;
+  g_motors[2].hw.en_port = GPIOA;
+  g_motors[2].hw.en_pin = GPIO_PIN_10;
+  g_motors[2].hw.oc_port = GPIOB;
+  g_motors[2].hw.oc_pin = GPIO_PIN_6;
 
-  /* Rear-Right (index 3) */
+  /* ── RR ────────────────────────────────────────────────────── */
   g_motors[3].hw.pwm_timer = &htim8;
   g_motors[3].hw.pwm_channel = TIM_CHANNEL_2;
   g_motors[3].hw.enc_timer = &htim5;
   g_motors[3].hw.dir_port = GPIOA;
   g_motors[3].hw.dir_pin = GPIO_PIN_3;
-  g_motors[3].hw.en_port = GPIOD;
-  g_motors[3].hw.en_pin = GPIO_PIN_3;
-  g_motors[3].hw.oc_port = GPIOE;
-  g_motors[3].hw.oc_pin = GPIO_PIN_3;
+  g_motors[3].hw.en_port = GPIOA;
+  g_motors[3].hw.en_pin = GPIO_PIN_11;
+  g_motors[3].hw.oc_port = GPIOB;
+  g_motors[3].hw.oc_pin = GPIO_PIN_7;
 }
 
-/* ─────────────────── UART Debug (optional) ────────────────────── */
+/* ============================================================== */
+/*                     IRQ Handler Stubs                           */
+/* ============================================================== */
 
-#ifdef DEBUG
-static void MX_USART3_UART_Init(void) {
-  __HAL_RCC_USART3_CLK_ENABLE();
-
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  HAL_UART_Init(&huart3);
-}
-#endif
-
-/* ─────────────────── Error Handler ────────────────────────────── */
-
-/**
- * @brief  HAL error handler — enter infinite loop with motors disabled.
- *         In production, trigger a watchdog reset instead.
+/*
+ * These IRQ handlers forward to HAL.  In a CubeMX-generated project,
+ * they would be in stm32h7xx_it.c — included here for completeness.
  */
-void Error_Handler(void) {
-  __disable_irq();
-  /* Ensure motors are off */
-  Motor_EmergencyStop(g_motors);
-  Safety_DisableContactor();
-  while (1) {
-    /* Trap — watchdog will reset in production */
-  }
-}
 
-/* ─────────────────── ISR Handlers (routing) ───────────────────── */
-
-/**
- * @brief  TIM6 & DAC combined IRQ handler.
- */
 void TIM6_DAC_IRQHandler(void) { HAL_TIM_IRQHandler(&htim6); }
 
-/**
- * @brief  FDCAN1 interrupt 0 handler.
- */
 void FDCAN1_IT0_IRQHandler(void) { HAL_FDCAN_IRQHandler(&hfdcan1); }
 
-/**
- * @brief  EXTI lines 10–15 handler (includes E-STOP on PC13).
- */
-void EXTI15_10_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(ESTOP_GPIO_PIN); }
+void EXTI15_10_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13); }
+
+void EXTI0_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0); }

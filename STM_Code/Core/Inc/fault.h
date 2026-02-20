@@ -3,12 +3,13 @@
  * @brief   Fault detection and reporting for the UGV.
  *
  * Monitors:
- *   - Heartbeat timeout (>300 ms without CAN 0x200)
+ *   - Heartbeat timeout (configurable, default >300 ms without CAN 0x200)
  *   - Motor stall (overcurrent flag while PWM active)
  *   - Encoder failure (no count change while PWM > threshold)
  *   - CAN bus error (HAL error flag)
  *
  * Fault status is exposed as a bitmask and can be transmitted via CAN.
+ * Heartbeat timeout is runtime-configurable via competition profiles.
  *
  * @author  UGV Firmware Team
  */
@@ -23,19 +24,19 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
-
 /* ─────────────────── Fault Bit Definitions ────────────────────── */
 
 #define FAULT_NONE 0x00U
-#define FAULT_HEARTBEAT_TIMEOUT 0x01U /**< No heartbeat for >300 ms     */
+#define FAULT_HEARTBEAT_TIMEOUT 0x01U /**< No heartbeat for >timeout   */
 #define FAULT_MOTOR_STALL 0x02U       /**< Overcurrent flag asserted    */
 #define FAULT_ENCODER_FAILURE 0x04U   /**< Encoder stuck while driving  */
 #define FAULT_CAN_ERROR 0x08U         /**< CAN bus / protocol error     */
 
 /* ───────────────────── Configuration ──────────────────────────── */
 
-/** Heartbeat timeout threshold in milliseconds. */
-#define FAULT_HEARTBEAT_TIMEOUT_MS 300U
+/** Default heartbeat timeout threshold in milliseconds.
+ *  Runtime-overridable via competition config.                     */
+#define FAULT_HEARTBEAT_TIMEOUT_MS_DEFAULT 300U
 
 /**
  * Minimum PWM duty (%) to consider a motor "actively driven"
@@ -56,6 +57,7 @@ typedef struct {
   uint32_t last_heartbeat_tick;     /**< HAL tick of last heartbeat RX */
   uint16_t encoder_fail_counter[4]; /**< Per-motor encoder fail count  */
   bool motor_overcurrent_flag[4];   /**< Per-motor overcurrent input   */
+  uint32_t heartbeat_timeout_ms;    /**< Runtime-configurable timeout  */
 } Fault_State_t;
 
 /* ─────────────────── Public API ───────────────────────────────── */

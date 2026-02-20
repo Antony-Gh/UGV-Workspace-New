@@ -1,14 +1,19 @@
 /**
  * @file    can_comm.c
- * @brief   CAN-FD communication implementation.
+ * @brief   CAN-FD communication implementation — expanded for
+ * multi-competition.
  *
  * FDCAN1 operates at 1 Mbps nominal / 5 Mbps data.
- * RX is handled via interrupt callback → parses velocity & heartbeat.
+ * RX is handled via interrupt callback → parses velocity, mode, config,
+ * reset, and heartbeat messages.
  * TX functions are non-blocking (post to TX FIFO).
  */
 
 #include "can_comm.h"
+#include "config.h"
 #include "fault.h"
+#include "lights.h"
+#include "safety.h"
 #include <string.h>
 
 /* ──────────────── Module-Level State ──────────────────────────── */
@@ -21,7 +26,7 @@ volatile CAN_VelocityCmd_t g_can_velocity_cmd = {0};
 volatile bool g_can_velocity_cmd_new = false;
 
 /* External reference to fault state for heartbeat update.
- * Defined in main.c and passed here at init time.               */
+ * Defined in main.c.                                             */
 extern Fault_State_t g_fault_state;
 
 /* ──────────────── Private Helpers ─────────────────────────────── */
@@ -55,17 +60,34 @@ static void can_transmit(uint32_t id, const uint8_t *data, uint32_t length) {
 void CAN_Comm_Init(FDCAN_HandleTypeDef *hfdcan) {
   s_hfdcan = hfdcan;
 
-  /* ── Configure RX filter: accept 0x100 and 0x200 into FIFO 0 ── */
+  /* ── Configure RX filters ──────────────────────────────────── */
+  /*
+   * Filter 0: 0x100 (Velocity) + 0x110 (Mode Select)
+   * Filter 1: 0x120 (Config)   + 0x130 (Reset)
+   * Filter 2: 0x200 (Heartbeat) — single ID in dual filter slot
+   */
 
   FDCAN_FilterTypeDef filter;
-
-  /* Filter 0: velocity command 0x100 */
   filter.IdType = FDCAN_STANDARD_ID;
-  filter.FilterIndex = 0U;
-  filter.FilterType = FDCAN_FILTER_DUAL; /* Match exact IDs */
+  filter.FilterType = FDCAN_FILTER_DUAL;
   filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+
+  /* Filter 0: velocity command + mode select */
+  filter.FilterIndex = 0U;
   filter.FilterID1 = CAN_ID_VELOCITY_CMD; /* 0x100 */
-  filter.FilterID2 = CAN_ID_HEARTBEAT;    /* 0x200 */
+  filter.FilterID2 = CAN_ID_MODE_SELECT;  /* 0x110 */
+  HAL_FDCAN_ConfigFilter(hfdcan, &filter);
+
+  /* Filter 1: config profile + reset command */
+  filter.FilterIndex = 1U;
+  filter.FilterID1 = CAN_ID_CONFIG_PROFILE; /* 0x120 */
+  filter.FilterID2 = CAN_ID_RESET_CMD;      /* 0x130 */
+  HAL_FDCAN_ConfigFilter(hfdcan, &filter);
+
+  /* Filter 2: heartbeat (store same ID in both slots) */
+  filter.FilterIndex = 2U;
+  filter.FilterID1 = CAN_ID_HEARTBEAT; /* 0x200 */
+  filter.FilterID2 = CAN_ID_HEARTBEAT; /* 0x200 */
   HAL_FDCAN_ConfigFilter(hfdcan, &filter);
 
   /* Reject all non-matching standard IDs */
@@ -91,6 +113,7 @@ void CAN_Comm_RxCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
   while (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rx_header, rx_data) ==
          HAL_OK) {
     switch (rx_header.Identifier) {
+
     /* ── 0x100: Velocity Command ────────────────────── */
     case CAN_ID_VELOCITY_CMD:
       if (rx_header.DataLength >= FDCAN_DLC_BYTES_8) {
@@ -99,6 +122,29 @@ void CAN_Comm_RxCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
         g_can_velocity_cmd_new = true;
       }
       break;
+
+    /* ── 0x110: Mode Select ─────────────────────────── */
+    case CAN_ID_MODE_SELECT: {
+      CAN_ModeCmd_t mode_cmd;
+      memcpy(&mode_cmd, rx_data, sizeof(CAN_ModeCmd_t));
+      Safety_SetMode(mode_cmd.mode != 0U);
+    } break;
+
+    /* ── 0x120: Config Profile ──────────────────────── */
+    case CAN_ID_CONFIG_PROFILE: {
+      CAN_ConfigCmd_t config_cmd;
+      memcpy(&config_cmd, rx_data, sizeof(CAN_ConfigCmd_t));
+      Config_Apply((Competition_t)config_cmd.competition);
+    } break;
+
+    /* ── 0x130: Reset Command ───────────────────────── */
+    case CAN_ID_RESET_CMD: {
+      CAN_ResetCmd_t reset_cmd;
+      memcpy(&reset_cmd, rx_data, sizeof(CAN_ResetCmd_t));
+      if (reset_cmd.reset_key == CAN_RESET_KEY) {
+        Safety_RequestReset();
+      }
+    } break;
 
     /* ── 0x200: Heartbeat ───────────────────────────── */
     case CAN_ID_HEARTBEAT:
@@ -117,7 +163,7 @@ void CAN_Comm_RxCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
 
 void CAN_Comm_SendTelemetry(float vel_fl, float vel_fr, float vel_rl,
                             float vel_rr, uint8_t system_state,
-                            uint8_t fault_flags) {
+                            uint8_t fault_flags, uint8_t comp_id) {
   CAN_Telemetry_t payload;
 
   payload.velocity_fl = (int16_t)(vel_fl * CAN_VELOCITY_SCALE);
@@ -126,9 +172,32 @@ void CAN_Comm_SendTelemetry(float vel_fl, float vel_fr, float vel_rl,
   payload.velocity_rr = (int16_t)(vel_rr * CAN_VELOCITY_SCALE);
   payload.system_state = system_state;
   payload.fault_flags = fault_flags;
+  payload.comp_id = comp_id;
   payload.reserved = 0U;
 
   can_transmit(CAN_ID_TELEMETRY, (const uint8_t *)&payload, FDCAN_DLC_BYTES_12);
+}
+
+void CAN_Comm_SendOdometry(int32_t distance_mm, int16_t heading_cdeg) {
+  CAN_Odometry_t payload;
+
+  payload.distance_mm = distance_mm;
+  payload.heading_cdeg = heading_cdeg;
+  payload.reserved = 0U;
+
+  can_transmit(CAN_ID_ODOMETRY, (const uint8_t *)&payload, FDCAN_DLC_BYTES_8);
+}
+
+void CAN_Comm_SendBattery(uint16_t voltage_mv, int16_t current_ma,
+                          int16_t temp_cdeg) {
+  CAN_BatteryTelemetry_t payload;
+
+  payload.voltage_mv = voltage_mv;
+  payload.current_ma = current_ma;
+  payload.temp_cdeg = temp_cdeg;
+  payload.reserved = 0U;
+
+  can_transmit(CAN_ID_BATTERY, (const uint8_t *)&payload, FDCAN_DLC_BYTES_8);
 }
 
 void CAN_Comm_SendFault(uint8_t fault_flags, uint8_t system_state) {

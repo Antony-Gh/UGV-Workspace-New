@@ -1,9 +1,9 @@
 /**
  * @file    fault.c
- * @brief   Fault detection implementation.
+ * @brief   Fault detection implementation — enhanced with configurable timeout.
  *
  * Called every 1 ms from the control loop to check:
- *   1. Heartbeat timeout  (>300 ms)
+ *   1. Heartbeat timeout  (runtime-configurable, default >300 ms)
  *   2. Motor stall        (overcurrent flag while PWM active)
  *   3. Encoder failure    (no change for 100 consecutive cycles while driving)
  *   4. CAN bus error      (set externally via Fault_SetCANError)
@@ -18,6 +18,7 @@ void Fault_Init(Fault_State_t *state) {
   memset(state, 0, sizeof(Fault_State_t));
   state->active_faults = FAULT_NONE;
   state->last_heartbeat_tick = 0U; /* Will be set on first heartbeat */
+  state->heartbeat_timeout_ms = FAULT_HEARTBEAT_TIMEOUT_MS_DEFAULT;
 }
 
 void Fault_Check(Fault_State_t *state, uint32_t current_tick,
@@ -27,7 +28,7 @@ void Fault_Check(Fault_State_t *state, uint32_t current_tick,
   /*    Only check if we have ever received a heartbeat.        */
   if (state->last_heartbeat_tick != 0U) {
     uint32_t elapsed = current_tick - state->last_heartbeat_tick;
-    if (elapsed > FAULT_HEARTBEAT_TIMEOUT_MS) {
+    if (elapsed > state->heartbeat_timeout_ms) {
       state->active_faults |= FAULT_HEARTBEAT_TIMEOUT;
     } else {
       state->active_faults &= ~FAULT_HEARTBEAT_TIMEOUT;
