@@ -1,0 +1,30 @@
+
+# initialize git repository
+
+git init
+
+git status
+
+git add .
+
+git commit -m "Initial commit"
+
+gh repo create UGV-Workspace-New --public --source=. --remote=origin --push
+
+
+
+
+
+# git remote add origin https://github.com/Antony-gh/ROV-Workspace-New.git
+
+# git push -u origin 
+
+
+git status
+
+git add .
+
+git commit -m "Organize Workspace files"
+
+
+git push -u origin main
